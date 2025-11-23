@@ -1,16 +1,23 @@
-"""钱包生成与校验服务。"""
+"""钱包生成与校验服务，支持 EVM 与 Solana 双链。"""
 
 import hashlib
 import hmac
 from typing import Callable, List, Optional, Tuple
 
+from base58 import b58encode
 from eth_account import Account
 from eth_keys import constants as eth_constants
 from eth_keys import keys as eth_keys
 from mnemonic import Mnemonic
-from web3 import Web3
+from nacl.signing import SigningKey
 
-from config import DERIVATION_PATH_TEMPLATE
+from config import (
+    ChainType,
+    DERIVATION_PATH_TEMPLATE_EVM,
+    DERIVATION_PATH_TEMPLATE_SOL,
+    MAX_WALLET_COUNT,
+    NetworkConfig,
+)
 from models import WalletRecord
 
 # 启用 HD 钱包支持（eth-account 默认关闭，需要显式允许）
@@ -55,7 +62,7 @@ def _mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
 
 
 def _derive_child(private_key: bytes, chain_code: bytes, index: int, hardened: bool) -> Tuple[bytes, bytes]:
-    """执行单步 BIP32 子密钥派生。"""
+    """执行单步 BIP32 子密钥派生（secp256k1）。"""
     if hardened:
         data = b"\x00" + private_key + index.to_bytes(4, "big")
     else:
@@ -69,7 +76,7 @@ def _derive_child(private_key: bytes, chain_code: bytes, index: int, hardened: b
 
 
 def _derive_private_key_from_path(seed: bytes, path: str) -> bytes:
-    """从种子和路径计算最终私钥。"""
+    """从种子和路径计算最终 secp256k1 私钥。"""
     I = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
     priv, chain = I[:32], I[32:]
     segments = path.split("/")[1:]  # 跳过 m
@@ -82,38 +89,83 @@ def _derive_private_key_from_path(seed: bytes, path: str) -> bytes:
     return priv
 
 
-def _derive_account(mnemonic: str, path: str) -> Tuple[str, str]:
-    """从助记词和派生路径生成地址与私钥。"""
+def _derive_evm_account(mnemonic: str, path: str) -> Tuple[str, str]:
+    """从助记词和派生路径生成 EVM 地址与私钥。"""
     seed = _mnemonic_to_seed(mnemonic, "")
     priv_key_bytes = _derive_private_key_from_path(seed, path)
     acct = Account.from_key(priv_key_bytes)
-    address = Web3.to_checksum_address(acct.address)
+    address = acct.address
     private_key = acct.key.hex()
     return address, private_key
 
 
+def _slip10_derive_ed25519(seed: bytes, path: str) -> bytes:
+    """依据 SLIP-0010 派生 ed25519 私钥种子，默认将未加 ' 的段也按硬化处理。"""
+    # 主密钥
+    I = hmac.new(b"ed25519 seed", seed, hashlib.sha512).digest()
+    key, chain_code = I[:32], I[32:]
+    segments = path.split("/")[1:]  # 跳过 m
+    for seg in segments:
+        if not seg:
+            continue
+        hardened = seg.endswith("'")
+        index = int(seg.rstrip("'"))
+        # ed25519 仅支持硬化，为兼容未加 ' 的模板也按硬化处理
+        if not hardened:
+            hardened = True
+        if hardened:
+            index |= 0x80000000
+        data = b"\x00" + key + index.to_bytes(4, "big")
+        I = hmac.new(chain_code, data, hashlib.sha512).digest()
+        key, chain_code = I[:32], I[32:]
+    return key
+
+
+def _derive_solana_account(mnemonic: str, index: int, path_template: str) -> Tuple[str, str, str]:
+    """从助记词生成 Solana 地址与 Base58 私钥（64 字节）。"""
+    seed = _mnemonic_to_seed(mnemonic, "")
+    path = path_template.format(index=index)
+    private_seed = _slip10_derive_ed25519(seed, path)
+    signing_key = SigningKey(private_seed)
+    verify_key = signing_key.verify_key
+    secret_key_bytes = signing_key.encode() + verify_key.encode()
+    address = b58encode(bytes(verify_key)).decode("utf-8")
+    secret_key = b58encode(secret_key_bytes).decode("utf-8")
+    return address, secret_key, path
+
+
 def generate_wallets(
     count: int,
-    network_name: str,
+    network: NetworkConfig,
     progress_cb: Optional[Callable[[int], None]] = None,
 ) -> List[WalletRecord]:
     """
     批量生成钱包记录（每个钱包独立助记词）。
 
     :param count: 生成数量
-    :param network_name: 展示用的网络名称
+    :param network: 选中的网络配置
     :param progress_cb: 进度回调，接受当前完成数量
     """
+    validate_wallet_count(count, max_count=MAX_WALLET_COUNT)
     wallets: List[WalletRecord] = []
 
     for i in range(count):
         mnemonic = _generate_mnemonic(12)
-        path = DERIVATION_PATH_TEMPLATE.format(index=i)
-        address, private_key = _derive_account(mnemonic, path)
+        if network.chain_type == ChainType.EVM:
+            path_template = network.derivation_path_template or DERIVATION_PATH_TEMPLATE_EVM
+            path = path_template.format(index=i)
+            address, private_key = _derive_evm_account(mnemonic, path)
+        elif network.chain_type == ChainType.SOLANA:
+            path_template = network.derivation_path_template or DERIVATION_PATH_TEMPLATE_SOL
+            address, private_key, path = _derive_solana_account(mnemonic, i, path_template)
+        else:  # pragma: no cover - 理论不会触发
+            raise ValueError(f"未支持的链类型: {network.chain_type}")
+
         wallets.append(
             WalletRecord(
                 index=i + 1,
-                network=network_name,
+                chain_type=network.chain_type,
+                network=network.name,
                 address=address,
                 mnemonic=mnemonic,
                 derivation_path=path,
